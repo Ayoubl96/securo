@@ -14,6 +14,9 @@ from app.services import connection_service
 logger = logging.getLogger(__name__)
 
 STALE_THRESHOLD = timedelta(hours=4)
+# PSD2 banks allow about four unattended reads a day; 4 hours means six, so the
+# last ones get throttled. Six hours stays inside the limit.
+STALE_THRESHOLD_BY_PROVIDER = {"enable_banking": timedelta(hours=6)}
 
 
 def _make_session_maker():
@@ -32,14 +35,23 @@ async def _sync_all() -> int:
         async with session_maker() as session:
             result = await session.execute(
                 select(
-                    BankConnection.id, BankConnection.user_id, BankConnection.last_sync_at
+                    BankConnection.id,
+                    BankConnection.user_id,
+                    BankConnection.last_sync_at,
+                    BankConnection.provider,
                 ).where(
                     BankConnection.status.in_(["active", "error"]),
                     (BankConnection.last_sync_at < cutoff)
                     | (BankConnection.last_sync_at.is_(None)),
                 )
             )
-            connections = result.all()
+            now = datetime.now(timezone.utc)
+            connections = [
+                (conn_id, user_id, last_sync)
+                for conn_id, user_id, last_sync, provider in result.all()
+                if last_sync is None
+                or now - last_sync >= STALE_THRESHOLD_BY_PROVIDER.get(provider, STALE_THRESHOLD)
+            ]
 
         logger.info(
             "Sync check: found %d stale connections (cutoff=%s)",

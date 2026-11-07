@@ -31,6 +31,10 @@ class AccountData:
     minimum_payment: Optional[Decimal] = None
     card_brand: Optional[str] = None
     card_level: Optional[str] = None
+    # False when the provider could not read the balance this time (network
+    # error). `balance` is then a placeholder: sync must keep the last known
+    # balance instead of writing it, or a transient failure zeroes the account.
+    balance_known: bool = True
 
 
 @dataclass

@@ -646,7 +646,8 @@ async def handle_oauth_callback(
         # that SUM(all transactions) matches the provider-reported balance. Any
         # history that falls outside the provider's lookback window gets
         # absorbed into this synthetic transaction.
-        await sync_opening_balance_for_connected_account(session, account)
+        if acc_data.balance_known:
+            await sync_opening_balance_for_connected_account(session, account)
 
     # Detect transfer pairs among newly synced transactions
     await detect_transfer_pairs(session, workspace_id, candidate_ids=new_tx_ids)
@@ -708,6 +709,85 @@ async def _fuzzy_match_manual(
 
     if best_match and best_score >= 0.6:
         return best_match
+    return None
+
+
+async def _rebind_reauthorized_account(
+    session: AsyncSession,
+    connection: BankConnection,
+    acc_data,
+    accounts_data: list,
+) -> Optional[Account]:
+    """Re-attach an account whose provider id changed after a re-authorization.
+
+    Some aggregators (Enable Banking) hand out new account ids for every new
+    authorization session. Matching only on external_id then creates a second
+    account and re-imports the whole history. When exactly one open account of
+    this connection is no longer reported by the bank, and exactly one reported
+    account is unknown, and they agree on name, type and currency, they are the
+    same account: move the new id onto the existing row. Anything ambiguous
+    returns None and keeps the old behaviour (a new account).
+    """
+    rows = (
+        await session.execute(
+            select(Account).where(
+                Account.connection_id == connection.id,
+                Account.is_closed.is_(False),
+            )
+        )
+    ).scalars().all()
+    known_ids = {a.external_id for a in rows}
+    reported_ids = {a.external_id for a in accounts_data}
+    orphans = [
+        a
+        for a in rows
+        if a.external_id not in reported_ids
+        and a.type == acc_data.type
+        and a.currency == acc_data.currency
+        and a.name == acc_data.name
+    ]
+    unknown = [
+        a
+        for a in accounts_data
+        if a.external_id not in known_ids
+        and a.type == acc_data.type
+        and a.currency == acc_data.currency
+        and a.name == acc_data.name
+    ]
+    if len(orphans) != 1 or len(unknown) != 1:
+        return None
+    orphans[0].external_id = acc_data.external_id
+    await session.flush()
+    return orphans[0]
+
+
+async def _find_reissued_duplicate(
+    session: AsyncSession,
+    account_id: uuid.UUID,
+    txn_data,
+    batch_external_ids: set,
+) -> Optional[Transaction]:
+    """After a re-authorization the same booked transaction comes back under a
+    new external id. Find the stored copy (same date, amount, type and
+    description) that no incoming id claims, so it is reused, not duplicated.
+    Rows whose id the bank still reports are excluded: those are matched by id,
+    which keeps two genuinely identical same-day transactions as two rows.
+    """
+    result = await session.execute(
+        select(Transaction).where(
+            Transaction.account_id == account_id,
+            Transaction.source == "sync",
+            Transaction.date == txn_data.date,
+            Transaction.amount == txn_data.amount,
+            Transaction.type == txn_data.type,
+        )
+    )
+    wanted = (txn_data.description or "").strip().lower()
+    for candidate in result.scalars():
+        if candidate.external_id in batch_external_ids:
+            continue
+        if (candidate.description or "").strip().lower() == wanted:
+            return candidate
     return None
 
 
@@ -1131,6 +1211,12 @@ async def sync_connection(
                 )
             )
             account = result.scalar_one_or_none()
+            rebound = False
+            if account is None:
+                account = await _rebind_reauthorized_account(
+                    session, connection, acc_data, accounts_data
+                )
+                rebound = account is not None
 
             # Honor user intent: a closed connected account stays closed and is
             # not touched by sync. The row is left alone (no balance/name
@@ -1141,7 +1227,8 @@ async def sync_connection(
                 continue
 
             if account:
-                account.balance = acc_data.balance
+                if acc_data.balance_known:
+                    account.balance = acc_data.balance
                 account.name = acc_data.name
                 if acc_data.type == "credit_card":
                     # Preserve existing CC metadata when the provider doesn't
@@ -1207,6 +1294,11 @@ async def sync_connection(
             if not import_pending:
                 transactions_data = [t for t in transactions_data if t.status != "pending"]
 
+            # A first read, or a re-bound account, means the bank may have
+            # re-issued every id: stored copies are then matched by content.
+            reauth = rebound or connection.last_sync_at is None
+            batch_external_ids = {t.external_id for t in transactions_data}
+
             for txn_data in transactions_data:
                 existing = await session.execute(
                     select(Transaction).where(
@@ -1215,6 +1307,16 @@ async def sync_connection(
                     )
                 )
                 existing_tx = existing.scalar_one_or_none()
+                if existing_tx is None and reauth:
+                    reissued = await _find_reissued_duplicate(
+                        session, account.id, txn_data, batch_external_ids
+                    )
+                    if reissued is not None:
+                        reissued.external_id = txn_data.external_id
+                        reissued.raw_data = txn_data.raw_data
+                        if reissued.status == "pending" and txn_data.status == "posted":
+                            reissued.status = "posted"
+                        continue
                 if existing_tx:
                     # User-flagged rows are frozen: skip status/bill drift so
                     # a re-sync can't revive a transaction the user hid.
@@ -1344,7 +1446,9 @@ async def sync_connection(
 
             # Reconcile the opening balance after any new transactions land so
             # SUM(all txs) keeps matching account.balance from the provider.
-            await sync_opening_balance_for_connected_account(session, account)
+            # Skipped when the balance could not be read this time.
+            if acc_data.balance_known:
+                await sync_opening_balance_for_connected_account(session, account)
 
         # Detect transfer pairs among newly synced transactions
         if new_tx_ids:

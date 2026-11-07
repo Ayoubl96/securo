@@ -412,12 +412,14 @@ class EnableBankingProvider(BankProvider):
         currency = raw.get("currency") or "EUR"
         # EB doesn't include balances in the session payload; fetch separately.
         balance = Decimal("0")
+        balance_known = True
         try:
             bal_resp = await self._request("GET", f"/accounts/{uid}/balances")
             picked = _pick_balance(bal_resp.get("balances") or [])
             balance = _balance_decimal(picked)
             currency = _balance_currency(picked, currency)
         except (httpx.HTTPError, SessionExpiredError) as exc:
+            balance_known = False
             logger.warning(
                 "Failed to fetch balances for account %s: %s", uid, exc
             )
@@ -433,6 +435,7 @@ class EnableBankingProvider(BankProvider):
             type=_map_cash_account_type(raw.get("cash_account_type")),
             balance=balance,
             currency=currency,
+            balance_known=balance_known,
         )
 
     # ----- account / transaction fetches -----
